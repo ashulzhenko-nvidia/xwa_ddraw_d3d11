@@ -11,6 +11,9 @@
 #include "ExecuteBufferDumper.h"
 #include "TextureSurface.h"
 
+#include <nvapi.h>
+#include <nvapi_lite_stereo.h>
+
 class RenderStates
 {
 public:
@@ -597,6 +600,10 @@ HRESULT Direct3DDevice::Execute(
 
 	context->IASetInputLayout(this->_deviceResources->_inputLayout);
 	context->VSSetShader(this->_deviceResources->_vertexShader, nullptr, 0);
+	if (this->_deviceResources->_isStereoEnabled)
+	{
+		context->GSSetShader(this->_deviceResources->_geometryShader, nullptr, 0);
+	}
 	context->PSSetShader(this->_deviceResources->_pixelShaderSolid, nullptr, 0);
 	context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	context->RSSetState(this->_deviceResources->_rasterizerState);
@@ -610,42 +617,43 @@ HRESULT Direct3DDevice::Execute(
 	this->_renderStates->BlendDescChanged = true;
 	this->_renderStates->DepthStencilDescChanged = true;
 
+	if (this->_deviceResources->_isStereoEnabled)
+	{
+		struct GeomConstBufferData
+		{
+			float stereoParams[4];
+		} geomConstBufferData;
+
+		float convergence = 0;
+		float separationPercentage = 0;
+		float eyeSeparation = 0;
+
+		NvAPI_Stereo_GetConvergence(this->_deviceResources->_stereoHandle, &convergence);
+		NvAPI_Stereo_GetSeparation(this->_deviceResources->_stereoHandle, &separationPercentage);
+		NvAPI_Stereo_GetEyeSeparation(this->_deviceResources->_stereoHandle, &eyeSeparation);
+
+		geomConstBufferData.stereoParams[0] = eyeSeparation * separationPercentage / 100;
+		geomConstBufferData.stereoParams[1] = convergence;
+
+		context->UpdateSubresource(this->_deviceResources->_gsConstantBuffer, 0, nullptr, &geomConstBufferData, 0, 0);
+		context->GSSetConstantBuffers(0, 1, this->_deviceResources->_gsConstantBuffer.GetAddressOf());
+	}
+
+	struct ConstBufferData
+	{
+		float viewportScale[4];
+		float centerAndExtent[4];
+	};
+	ConstBufferData constBufferData;
+
 	if (SUCCEEDED(hr))
 	{
 		step = "ConstantBuffer";
 
-		UINT w;
-		UINT h;
+		this->_deviceResources->SetViewport(this->_deviceResources->_displayWidth, this->_deviceResources->_displayHeight);
 
-		if (g_config.AspectRatioPreserved)
-		{
-			if (this->_deviceResources->_backbufferHeight * this->_deviceResources->_displayWidth <= this->_deviceResources->_backbufferWidth * this->_deviceResources->_displayHeight)
-			{
-				w = this->_deviceResources->_backbufferHeight * this->_deviceResources->_displayWidth / this->_deviceResources->_displayHeight;
-				h = this->_deviceResources->_backbufferHeight;
-			}
-			else
-			{
-				w = this->_deviceResources->_backbufferWidth;
-				h = this->_deviceResources->_backbufferWidth * this->_deviceResources->_displayHeight / this->_deviceResources->_displayWidth;
-			}
-		}
-		else
-		{
-			w = this->_deviceResources->_backbufferWidth;
-			h = this->_deviceResources->_backbufferHeight;
-		}
-
-		UINT left = (this->_deviceResources->_backbufferWidth - w) / 2;
-		UINT top = (this->_deviceResources->_backbufferHeight - h) / 2;
-
-		float scale;
-
-		if (!g_config.XWAMode || this->_deviceResources->_frontbufferSurface == nullptr)
-		{
-			scale = 1.0f;
-		}
-		else
+		float scale = 1.0f;
+		if (g_config.XWAMode && this->_deviceResources->_frontbufferSurface != nullptr)
 		{
 			if (this->_deviceResources->_backbufferHeight * this->_deviceResources->_displayWidth <= this->_deviceResources->_backbufferWidth * this->_deviceResources->_displayHeight)
 			{
@@ -659,20 +667,10 @@ HRESULT Direct3DDevice::Execute(
 			scale *= g_config.Concourse3DScale;
 		}
 
-		D3D11_VIEWPORT viewport;
-		viewport.TopLeftX = (float)left;
-		viewport.TopLeftY = (float)top;
-		viewport.Width = (float)w;
-		viewport.Height = (float)h;
-		viewport.MinDepth = D3D11_MIN_DEPTH;
-		viewport.MaxDepth = D3D11_MAX_DEPTH;
-
-		context->RSSetViewports(1, &viewport);
-
-		const float viewportScale[4] = { 2.0f / (float)this->_deviceResources->_displayWidth, -2.0f / (float)this->_deviceResources->_displayHeight, scale, 0 };
-
-		context->UpdateSubresource(this->_deviceResources->_constantBuffer, 0, nullptr, viewportScale, 0, 0);
-		context->VSSetConstantBuffers(0, 1, this->_deviceResources->_constantBuffer.GetAddressOf());
+		constBufferData.viewportScale[0] = 2.0f / (float)this->_deviceResources->_displayWidth;
+		constBufferData.viewportScale[1] = -2.0f / (float)this->_deviceResources->_displayHeight;
+		constBufferData.viewportScale[2] = scale;
+		constBufferData.viewportScale[3] = 0;
 	}
 
 	if (SUCCEEDED(hr))
@@ -883,6 +881,41 @@ HRESULT Direct3DDevice::Execute(
 					context->OMSetDepthStencilState(depthState, 0);
 
 					this->_renderStates->DepthStencilDescChanged = false;
+
+					constBufferData.viewportScale[3] = (depthDesc.DepthFunc == D3D11_COMPARISON_ALWAYS && depthDesc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO) ? 1.0f : 0.0f;
+				}
+
+				// calculate objectCenter
+				{
+					const D3DTLVERTEX* vertices = (D3DTLVERTEX*)executeBuffer->_buffer;
+
+					D3DTLVERTEX vMin, vMax;
+					vMin.sx = vMin.sy = vMin.sz = +FLT_MAX;
+					vMax.sx = vMax.sy = vMax.sz = -FLT_MAX;
+					
+					auto processVertex = [&](WORD index) {
+						const D3DTLVERTEX& v = vertices[index];
+						const float z = 1.0f / v.rhw;
+						vMin.sx = min(vMin.sx, v.sx); vMin.sy = min(vMin.sy, v.sy); vMin.sz = min(vMin.sz, z);
+						vMax.sx = max(vMax.sx, v.sx); vMax.sy = max(vMax.sy, v.sy); vMax.sz = max(vMax.sz, z);
+					};
+
+					LPD3DTRIANGLE triangle = (LPD3DTRIANGLE)(instruction + 1);
+					for (WORD i = 0; i < instruction->wCount; i++)
+					{
+						processVertex(triangle->v1);
+						processVertex(triangle->v2);
+						processVertex(triangle->v3);
+						++triangle;
+					}
+
+					constBufferData.centerAndExtent[0] = (vMin.sx + vMax.sx) * 0.5f;
+					constBufferData.centerAndExtent[1] = (vMin.sy + vMax.sy) * 0.5f;
+					constBufferData.centerAndExtent[2] = (vMin.sz + vMax.sz) * 0.5f;
+					constBufferData.centerAndExtent[3] = (vMax.sz - vMin.sz) * 0.5f;
+
+					context->UpdateSubresource(this->_deviceResources->_vsConstantBuffer, 0, nullptr, &constBufferData, 0, 0);
+					context->VSSetConstantBuffers(0, 1, this->_deviceResources->_vsConstantBuffer.GetAddressOf());
 				}
 
 				step = "Draw";
@@ -1199,7 +1232,7 @@ HRESULT Direct3DDevice::BeginScene()
 	LogText(str.str());
 #endif
 
-	if (!this->_deviceResources->_renderTargetView)
+	if (!this->_deviceResources->_offscreenBufferView)
 	{
 #if LOGGER
 		str.str("\tD3DERR_SCENE_BEGIN_FAILED");
@@ -1217,13 +1250,16 @@ HRESULT Direct3DDevice::BeginScene()
 	if (!this->_deviceResources->sceneRendered || this->_deviceResources->clearColorSet)
 	{
 		// Clear only directly after flip
-		context->ClearRenderTargetView(this->_deviceResources->_renderTargetView, this->_deviceResources->clearColor);
+		context->ClearRenderTargetView(this->_deviceResources->_offscreenBufferView, this->_deviceResources->clearColor);
 		this->_deviceResources->clearColorSet = false;
 	}
 	if (!this->_deviceResources->sceneRendered || this->_deviceResources->clearDepthSet)
 	{
 	    context->ClearDepthStencilView(this->_deviceResources->_depthStencilView, D3D11_CLEAR_DEPTH, this->_deviceResources->clearDepth, 0);
 		this->_deviceResources->clearDepthSet = false;
+
+		const FLOAT clearLinearDepth[4] = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+		context->ClearRenderTargetView(this->_deviceResources->_linearDepthRenderTargetView, clearLinearDepth);
     }
 
 	if (FAILED(this->_deviceResources->RenderMain(this->_deviceResources->_backbufferSurface->_buffer, this->_deviceResources->_displayWidth, this->_deviceResources->_displayHeight, this->_deviceResources->_displayBpp)))

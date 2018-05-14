@@ -10,11 +10,13 @@ struct PixelShaderInput
 	float4 pos : SV_POSITION;
 	float4 color : COLOR0;
 	float2 tex : TEXCOORD;
+	float depth : TEXCOORD1;
 };
 
-float4 main(PixelShaderInput input) : SV_TARGET
+void main(PixelShaderInput input, out float4 outColor : SV_TARGET, out float outDepth : SV_TARGET1)
 {
 	float4 texelColor = texture0.Sample(sampler0, input.tex);
 
-	return texelColor * input.color;
+	outColor = texelColor * input.color;
+	outDepth = input.depth;
 }

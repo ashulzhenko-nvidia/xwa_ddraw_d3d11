@@ -20,6 +20,7 @@ struct PixelShaderInput
 	float4 pos : SV_POSITION;
 	float4 color : COLOR0;
 	float2 tex : TEXCOORD;
+	float depth : TEXCOORD1;
 };
 
 PixelShaderInput main(VertexShaderInput input)
@@ -37,5 +38,6 @@ PixelShaderInput main(VertexShaderInput input)
 
 	output.tex = input.tex;
 
+	output.depth = output.pos.w;
 	return output;
 }

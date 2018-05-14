@@ -7,6 +7,9 @@
 #include "DirectDrawPalette.h"
 #include "PrimarySurface.h"
 
+#include <nvapi.h>
+#include <nvapi_lite_stereo.h>
+
 #ifdef _DEBUG
 #include "../Debug/LanczosScalePixelShader.h"
 #include "../Debug/MainVertexShader.h"
@@ -17,6 +20,8 @@
 #include "../Debug/PixelShaderAtestTextureNoAlpha.h"
 #include "../Debug/PixelShaderTexture.h"
 #include "../Debug/PixelShaderSolid.h"
+#include "../Debug/MainGeometryShader.h"
+#include "../Debug/GeometryShader.h"
 #else
 #include "../Release/LanczosScalePixelShader.h"
 #include "../Release/MainVertexShader.h"
@@ -27,6 +32,8 @@
 #include "../Release/PixelShaderAtestTextureNoAlpha.h"
 #include "../Release/PixelShaderTexture.h"
 #include "../Release/PixelShaderSolid.h"
+#include "../Release/MainGeometryShader.h"
+#include "../Release/GeometryShader.h"
 #endif
 
 struct MainVertex
@@ -86,6 +93,9 @@ DeviceResources::DeviceResources()
 	this->sceneRenderedEmpty = false;
 	this->inScene = false;
 	this->inSceneBackbufferLocked = false;
+
+	this->_isStereoEnabled = false;
+	this->_stereoHandle = nullptr;
 }
 
 DeviceResources::~DeviceResources()
@@ -100,6 +110,19 @@ DeviceResources::~DeviceResources()
 
 HRESULT DeviceResources::Initialize()
 {
+	// Init Stereo
+	if (NvAPI_Initialize() == NVAPI_OK)
+	{
+		NvU8 stereoEnabled;
+		if (NvAPI_Stereo_IsEnabled(&stereoEnabled) == NVAPI_OK && stereoEnabled)
+		{
+			if (NvAPI_Stereo_SetDriverMode(NVAPI_STEREO_DRIVER_MODE_DIRECT) == NVAPI_OK)
+			{
+				_isStereoEnabled = true;
+			}
+		}
+	}
+
 	HRESULT hr;
 
 	D3D_FEATURE_LEVEL featureLevels[] =
@@ -157,6 +180,11 @@ HRESULT DeviceResources::Initialize()
 
 		messageShown = true;
 	}
+	else
+	{
+		// Activate Stereo
+		NvAPI_Stereo_CreateHandleFromIUnknown(this->_d3dDevice, &this->_stereoHandle);
+	}
 
 	return hr;
 }
@@ -166,10 +194,13 @@ HRESULT DeviceResources::OnSizeChanged(HWND hWnd, DWORD dwWidth, DWORD dwHeight)
 	HRESULT hr;
 	const char* step = "";
 
+	this->_linearDepthRenderTargetView.Release();
+	this->_linearDepthBuffer.Release();
 	this->_depthStencilView.Release();
 	this->_depthStencil.Release();
-	this->_renderTargetView.Release();
+	this->_offscreenBufferView.Release();
 	this->_offscreenBuffer.Release();
+	this->_backBufferView.Release();
 	this->_backBuffer.Release();
 	// Releasing a swap chain is only allowed after switching
 	// to windowed mode.
@@ -219,7 +250,7 @@ HRESULT DeviceResources::OnSizeChanged(HWND hWnd, DWORD dwWidth, DWORD dwHeight)
 			sd.BufferDesc.Width = g_config.Width;
 			sd.BufferDesc.Height = g_config.Height;
 			sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-			sd.BufferDesc.RefreshRate = md.RefreshRate;
+			sd.BufferDesc.RefreshRate = _isStereoEnabled ? DXGI_RATIONAL{ 120, 1 } : md.RefreshRate;
 			sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
 			sd.OutputWindow = hWnd;
 			sd.SampleDesc.Count = 1;
@@ -236,7 +267,7 @@ HRESULT DeviceResources::OnSizeChanged(HWND hWnd, DWORD dwWidth, DWORD dwHeight)
 
 			if (SUCCEEDED(hr))
 			{
-				this->_refreshRate = sd.BufferDesc.RefreshRate;
+				this->_refreshRate = _isStereoEnabled ? DXGI_RATIONAL{ 60, 1 } : sd.BufferDesc.RefreshRate;
 				if (g_config.Fullscreen == 1)
 				{
 					// A separate SetFullscreenState is recommended
@@ -283,11 +314,21 @@ HRESULT DeviceResources::OnSizeChanged(HWND hWnd, DWORD dwWidth, DWORD dwHeight)
 
 	if (SUCCEEDED(hr))
 	{
+		step = "BackBufferView";
+		D3D11_RENDER_TARGET_VIEW_DESC backBufferViewDesc;
+		backBufferViewDesc.Format = DXGI_FORMAT_UNKNOWN;
+		backBufferViewDesc.Texture2D.MipSlice = 0;
+		backBufferViewDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+		hr = this->_d3dDevice->CreateRenderTargetView(this->_backBuffer, &backBufferViewDesc, &this->_backBufferView);
+	}
+
+	if (SUCCEEDED(hr))
+	{
 		step = "OffscreenBuffer";
 
 		CD3D11_TEXTURE2D_DESC desc(
 			DXGI_FORMAT_B8G8R8A8_UNORM,
-			this->_backbufferWidth,
+			this->_backbufferWidth * (1 + _isStereoEnabled),
 			this->_backbufferHeight,
 			1,
 			1,
@@ -303,19 +344,19 @@ HRESULT DeviceResources::OnSizeChanged(HWND hWnd, DWORD dwWidth, DWORD dwHeight)
 
 	if (SUCCEEDED(hr))
 	{
-		step = "RenderTargetView";
-		D3D11_RENDER_TARGET_VIEW_DESC renderTargetViewDesc;
-		renderTargetViewDesc.Format = DXGI_FORMAT_UNKNOWN;
-		renderTargetViewDesc.Texture2D.MipSlice = 0;
-		renderTargetViewDesc.ViewDimension = this->_useMultisampling ? D3D11_RTV_DIMENSION_TEXTURE2DMS : D3D11_RTV_DIMENSION_TEXTURE2D;
-		hr = this->_d3dDevice->CreateRenderTargetView(this->_offscreenBuffer, &renderTargetViewDesc, &this->_renderTargetView);
+		step = "OffscreenBufferView";
+		D3D11_RENDER_TARGET_VIEW_DESC offscreenBufferViewDesc;
+		offscreenBufferViewDesc.Format = DXGI_FORMAT_UNKNOWN;
+		offscreenBufferViewDesc.Texture2D.MipSlice = 0;
+		offscreenBufferViewDesc.ViewDimension = this->_useMultisampling ? D3D11_RTV_DIMENSION_TEXTURE2DMS : D3D11_RTV_DIMENSION_TEXTURE2D;
+		hr = this->_d3dDevice->CreateRenderTargetView(this->_offscreenBuffer, &offscreenBufferViewDesc, &this->_offscreenBufferView);
 	}
 
 	if (SUCCEEDED(hr))
 	{
 		step = "DepthStencil";
 		D3D11_TEXTURE2D_DESC depthStencilDesc;
-		depthStencilDesc.Width = this->_backbufferWidth;
+		depthStencilDesc.Width = this->_backbufferWidth * (1 + _isStereoEnabled);
 		depthStencilDesc.Height = this->_backbufferHeight;
 		depthStencilDesc.MipLevels = 1;
 		depthStencilDesc.ArraySize = 1;
@@ -343,8 +384,40 @@ HRESULT DeviceResources::OnSizeChanged(HWND hWnd, DWORD dwWidth, DWORD dwHeight)
 
 	if (SUCCEEDED(hr))
 	{
+		step = "LinearDepthBuffer";
+
+		CD3D11_TEXTURE2D_DESC desc(
+			DXGI_FORMAT_R32_FLOAT,
+			this->_backbufferWidth,
+			this->_backbufferHeight,
+			1,
+			1,
+			D3D11_BIND_RENDER_TARGET,
+			D3D11_USAGE_DEFAULT,
+			0,
+			this->_sampleDesc.Count,
+			this->_sampleDesc.Quality,
+			0);
+
+		hr = this->_d3dDevice->CreateTexture2D(&desc, nullptr, &this->_linearDepthBuffer);
+	}
+
+	if (SUCCEEDED(hr))
+	{
+		step = "LinearDepthRenderTargetView";
+		D3D11_RENDER_TARGET_VIEW_DESC renderTargetViewDesc;
+		renderTargetViewDesc.Format = DXGI_FORMAT_UNKNOWN;
+		renderTargetViewDesc.Texture2D.MipSlice = 0;
+		renderTargetViewDesc.ViewDimension = this->_useMultisampling ? D3D11_RTV_DIMENSION_TEXTURE2DMS : D3D11_RTV_DIMENSION_TEXTURE2D;
+		hr = this->_d3dDevice->CreateRenderTargetView(this->_linearDepthBuffer, &renderTargetViewDesc, &this->_linearDepthRenderTargetView);
+	}
+
+	if (SUCCEEDED(hr))
+	{
 		step = "Viewport";
-		this->_d3dDeviceContext->OMSetRenderTargets(1, this->_renderTargetView.GetAddressOf(), this->_depthStencilView.Get());
+
+		ID3D11RenderTargetView* renderTargets[] = { this->_offscreenBufferView.Get() };
+		this->_d3dDeviceContext->OMSetRenderTargets(1, renderTargets, this->_depthStencilView.Get());
 
 		D3D11_VIEWPORT viewport;
 		viewport.TopLeftX = 0;
@@ -422,6 +495,12 @@ HRESULT DeviceResources::LoadMainResources()
 
 	if (FAILED(hr = this->_d3dDevice->CreateInputLayout(vertexLayoutDesc, ARRAYSIZE(vertexLayoutDesc), g_MainVertexShader, sizeof(g_MainVertexShader), &_mainInputLayout)))
 		return hr;
+
+	if (_isStereoEnabled)
+	{
+		if (FAILED(hr = this->_d3dDevice->CreateGeometryShader(g_MainGeometryShader, sizeof(g_MainGeometryShader), nullptr, &_mainGeometryShader)))
+			return hr;
+	}
 
 	if (g_config.ScalingType == 2)
 	{
@@ -572,6 +651,12 @@ HRESULT DeviceResources::LoadResources()
 	if (FAILED(hr = this->_d3dDevice->CreateInputLayout(vertexLayoutDesc, ARRAYSIZE(vertexLayoutDesc), g_VertexShader, sizeof(g_VertexShader), &_inputLayout)))
 		return hr;
 
+	if (_isStereoEnabled)
+	{
+		if (FAILED(hr = this->_d3dDevice->CreateGeometryShader(g_GeometryShader, sizeof(g_GeometryShader), nullptr, &_geometryShader)))
+			return hr;
+	}
+
 	if (FAILED(hr = this->_d3dDevice->CreatePixelShader(g_PixelShaderTexture, sizeof(g_PixelShaderTexture), nullptr, &_pixelShaderTexture)))
 		return hr;
 
@@ -599,17 +684,30 @@ HRESULT DeviceResources::LoadResources()
 	if (FAILED(hr = this->_d3dDevice->CreateRasterizerState(&rsDesc, &this->_rasterizerState)))
 		return hr;
 
-	D3D11_BUFFER_DESC constantBufferDesc;
-	constantBufferDesc.ByteWidth = 16;
-	constantBufferDesc.Usage = D3D11_USAGE_DEFAULT;
-	constantBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-	constantBufferDesc.CPUAccessFlags = 0;
-	constantBufferDesc.MiscFlags = 0;
-	constantBufferDesc.StructureByteStride = 0;
+	D3D11_BUFFER_DESC vsConstantBufferDesc;
+	vsConstantBufferDesc.ByteWidth = 32;
+	vsConstantBufferDesc.Usage = D3D11_USAGE_DEFAULT;
+	vsConstantBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	vsConstantBufferDesc.CPUAccessFlags = 0;
+	vsConstantBufferDesc.MiscFlags = 0;
+	vsConstantBufferDesc.StructureByteStride = 0;
 
-	if (FAILED(hr = this->_d3dDevice->CreateBuffer(&constantBufferDesc, nullptr, &this->_constantBuffer)))
+	if (FAILED(hr = this->_d3dDevice->CreateBuffer(&vsConstantBufferDesc, nullptr, &this->_vsConstantBuffer)))
 		return hr;
 
+	if (_isStereoEnabled)
+	{
+		D3D11_BUFFER_DESC gsConstantBufferDesc;
+		gsConstantBufferDesc.ByteWidth = 16;
+		gsConstantBufferDesc.Usage = D3D11_USAGE_DEFAULT;
+		gsConstantBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		gsConstantBufferDesc.CPUAccessFlags = 0;
+		gsConstantBufferDesc.MiscFlags = 0;
+		gsConstantBufferDesc.StructureByteStride = 0;
+
+		if (FAILED(hr = this->_d3dDevice->CreateBuffer(&gsConstantBufferDesc, nullptr, &this->_gsConstantBuffer)))
+			return hr;
+	}
 	return hr;
 }
 
@@ -855,43 +953,14 @@ HRESULT DeviceResources::RenderMain(char* src, DWORD width, DWORD height, DWORD 
 
 	this->_d3dDeviceContext->IASetInputLayout(this->_mainInputLayout);
 	this->_d3dDeviceContext->VSSetShader(this->_mainVertexShader, nullptr, 0);
+	if (_isStereoEnabled)
+	{
+		this->_d3dDeviceContext->GSSetShader(this->_mainGeometryShader, nullptr, 0);
+	}
 	this->_d3dDeviceContext->PSSetShader(this->_mainPixelShader, nullptr, 0);
 	this->_d3dDeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-	UINT w;
-	UINT h;
-
-	if (g_config.AspectRatioPreserved)
-	{
-		if (this->_backbufferHeight * width <= this->_backbufferWidth * height)
-		{
-			w = this->_backbufferHeight * width / height;
-			h = this->_backbufferHeight;
-		}
-		else
-		{
-			w = this->_backbufferWidth;
-			h = this->_backbufferWidth * height / width;
-		}
-	}
-	else
-	{
-		w = this->_backbufferWidth;
-		h = this->_backbufferHeight;
-	}
-
-	UINT left = (this->_backbufferWidth - w) / 2;
-	UINT top = (this->_backbufferHeight - h) / 2;
-
-	D3D11_VIEWPORT viewport;
-	viewport.TopLeftX = (float)left;
-	viewport.TopLeftY = (float)top;
-	viewport.Width = (float)w;
-	viewport.Height = (float)h;
-	viewport.MinDepth = D3D11_MIN_DEPTH;
-	viewport.MaxDepth = D3D11_MAX_DEPTH;
-
-	this->_d3dDeviceContext->RSSetViewports(1, &viewport);
+	SetViewport(width, height);
 
 	if (SUCCEEDED(hr))
 	{
@@ -1123,4 +1192,70 @@ void DeviceResources::DefaultSurfaceDesc(LPDDSURFACEDESC lpDDSurfaceDesc, DWORD 
 	lpDDSurfaceDesc->dwHeight = this->_displayHeight;
 	lpDDSurfaceDesc->dwWidth = this->_displayWidth;
 	lpDDSurfaceDesc->lPitch = this->_displayWidth * (bpp == 1 ? 1 : 2);
+}
+
+void DeviceResources::ResolveBackBuffer()
+{
+	if (_isStereoEnabled)
+	{
+		NvAPI_Stereo_SetActiveEye(_stereoHandle, NVAPI_STEREO_EYE_LEFT);
+		D3D11_BOX srcBoxLeft = { 0, 0, 0, _backbufferWidth, _backbufferHeight, 1 };
+		_d3dDeviceContext->CopySubresourceRegion(_backBuffer, 0, 0, 0, 0, _offscreenBuffer, 0, &srcBoxLeft);
+
+		NvAPI_Stereo_SetActiveEye(_stereoHandle, NVAPI_STEREO_EYE_RIGHT);
+		D3D11_BOX srcBoxRight = { _backbufferWidth, 0, 0, _backbufferWidth * 2, _backbufferHeight, 1 };
+		_d3dDeviceContext->CopySubresourceRegion(_backBuffer, 0, 0, 0, 0, _offscreenBuffer, 0, &srcBoxRight);
+	}
+	else
+	{
+		_d3dDeviceContext->ResolveSubresource(_backBuffer, 0, _offscreenBuffer, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+	}
+}
+
+void DeviceResources::SetViewport(DWORD width, DWORD height)
+{
+	UINT w;
+	UINT h;
+
+	if (g_config.AspectRatioPreserved)
+	{
+		if (this->_backbufferHeight * width <= this->_backbufferWidth * height)
+		{
+			w = this->_backbufferHeight * width / height;
+			h = this->_backbufferHeight;
+		}
+		else
+		{
+			w = this->_backbufferWidth;
+			h = this->_backbufferWidth * height / width;
+		}
+	}
+	else
+	{
+		w = this->_backbufferWidth;
+		h = this->_backbufferHeight;
+	}
+
+	UINT left = (this->_backbufferWidth - w) / 2;
+	UINT top = (this->_backbufferHeight - h) / 2;
+
+	D3D11_VIEWPORT viewport;
+	viewport.TopLeftX = (float)left;
+	viewport.TopLeftY = (float)top;
+	viewport.Width = (float)w;
+	viewport.Height = (float)h;
+	viewport.MinDepth = D3D11_MIN_DEPTH;
+	viewport.MaxDepth = D3D11_MAX_DEPTH;
+
+	if (_isStereoEnabled)
+	{
+		D3D11_VIEWPORT viewports[2] = { viewport, viewport };
+		viewports[1].TopLeftX += _backbufferWidth;
+
+		this->_d3dDeviceContext->RSSetViewports(2, viewports);
+	}
+	else
+	{
+		this->_d3dDeviceContext->RSSetViewports(1, &viewport);
+	}
 }

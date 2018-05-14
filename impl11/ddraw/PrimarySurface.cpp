@@ -389,10 +389,13 @@ HRESULT PrimarySurface::Flip(
 
 	if (this->_deviceResources->sceneRenderedEmpty)
 	{
-		this->_deviceResources->_d3dDeviceContext->ClearRenderTargetView(this->_deviceResources->_renderTargetView, this->_deviceResources->clearColor);
+		this->_deviceResources->_d3dDeviceContext->ClearRenderTargetView(this->_deviceResources->_offscreenBufferView, this->_deviceResources->clearColor);
 		this->_deviceResources->clearColorSet = false;
 		this->_deviceResources->_d3dDeviceContext->ClearDepthStencilView(this->_deviceResources->_depthStencilView, D3D11_CLEAR_DEPTH, this->_deviceResources->clearDepth, 0);
 		this->_deviceResources->clearDepthSet = false;
+
+		const FLOAT clearLinearDepth[4] = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+		this->_deviceResources->_d3dDeviceContext->ClearRenderTargetView(this->_deviceResources->_linearDepthRenderTargetView, clearLinearDepth);
 	}
 
 	if (lpDDSurfaceTargetOverride != nullptr)
@@ -498,7 +501,7 @@ HRESULT PrimarySurface::Flip(
 
 				for (UINT i = 0; i < (g_config.RefreshLimit == 2 ? interval : 1); i++)
 				{
-					this->_deviceResources->_d3dDeviceContext->ResolveSubresource(this->_deviceResources->_backBuffer, 0, this->_deviceResources->_offscreenBuffer, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+					this->_deviceResources->ResolveBackBuffer();
 
 					if (FAILED(hr = this->_deviceResources->_swapChain->Present(g_config.RefreshLimit == 1 ? interval : 1, 0)))
 					{
@@ -549,7 +552,7 @@ HRESULT PrimarySurface::Flip(
 			// Draw pending backbuffer updates
 			this->_deviceResources->RenderMain(this->_deviceResources->_backbufferSurface->_buffer, this->_deviceResources->_displayWidth, this->_deviceResources->_displayHeight, this->_deviceResources->_displayBpp);
 
-			this->_deviceResources->_d3dDeviceContext->ResolveSubresource(this->_deviceResources->_backBuffer, 0, this->_deviceResources->_offscreenBuffer, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+			this->_deviceResources->ResolveBackBuffer();
 
 			if (FAILED(hr = this->_deviceResources->_swapChain->Present(1, 0)))
 			{

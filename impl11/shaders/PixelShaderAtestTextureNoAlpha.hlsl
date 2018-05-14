@@ -11,9 +11,10 @@ struct PixelShaderInput
 	float4 pos : SV_POSITION;
 	float4 color : COLOR0;
 	float2 tex : TEXCOORD;
+	float depth : TEXCOORD1;
 };
 
-float4 main(PixelShaderInput input) : SV_TARGET
+void main(PixelShaderInput input, out float4 outColor : SV_TARGET, out float outDepth : SV_TARGET1)
 {
 	float4 texelColor = texture0.Sample(sampler0, input.tex);
 	// The TIE engine does not expect 1-bit alpha to be interpolated,
@@ -23,5 +24,7 @@ float4 main(PixelShaderInput input) : SV_TARGET
 	// a bit worse
 	if (texelColor.a < 1 || input.color.a == 0) discard;
 	texelColor *= input.color;
-	return texelColor;
+
+	outColor = texelColor;
+	outDepth = input.depth;
 }

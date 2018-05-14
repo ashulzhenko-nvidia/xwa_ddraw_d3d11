@@ -24,5 +24,7 @@
     <FxCompile Include="SmoothScalePixelShader.hlsl" />
     <FxCompile Include="LanczosScalePixelShader.hlsl" />
     <FxCompile Include="PixelShaderAtestTextureNoAlpha.hlsl" />
+    <FxCompile Include="MainGeometryShader.hlsl" />
+    <FxCompile Include="GeometryShader.hlsl" />
   </ItemGroup>
 </Project>

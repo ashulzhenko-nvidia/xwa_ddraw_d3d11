@@ -33,6 +33,10 @@ public:
 
 	void DefaultSurfaceDesc(LPDDSURFACEDESC, DWORD caps);
 
+	void ResolveBackBuffer();
+
+	void SetViewport(DWORD width, DWORD height);
+
 	DWORD _displayWidth;
 	DWORD _displayHeight;
 	DWORD _displayBpp;
@@ -44,13 +48,18 @@ public:
 	ComPtr<IDXGISwapChain> _swapChain;
 	ComPtr<IDXGIOutput> _output;
 	ComPtr<ID3D11Texture2D> _backBuffer;
+	ComPtr<ID3D11RenderTargetView> _backBufferView;
 	ComPtr<ID3D11Texture2D> _offscreenBuffer;
-	ComPtr<ID3D11RenderTargetView> _renderTargetView;
+	ComPtr<ID3D11RenderTargetView> _offscreenBufferView;
 	ComPtr<ID3D11Texture2D> _depthStencil;
 	ComPtr<ID3D11DepthStencilView> _depthStencilView;
 
+	ComPtr<ID3D11Texture2D> _linearDepthBuffer;
+	ComPtr<ID3D11RenderTargetView> _linearDepthRenderTargetView;
+
 	ComPtr<ID3D11VertexShader> _mainVertexShader;
 	ComPtr<ID3D11InputLayout> _mainInputLayout;
+	ComPtr<ID3D11GeometryShader> _mainGeometryShader;
 	ComPtr<ID3D11PixelShader> _mainPixelShader;
 	ComPtr<ID3D11RasterizerState> _mainRasterizerState;
 	ComPtr<ID3D11SamplerState> _mainSamplerState;
@@ -63,12 +72,14 @@ public:
 
 	ComPtr<ID3D11VertexShader> _vertexShader;
 	ComPtr<ID3D11InputLayout> _inputLayout;
+	ComPtr<ID3D11GeometryShader> _geometryShader;
 	ComPtr<ID3D11PixelShader> _pixelShaderTexture;
 	ComPtr<ID3D11PixelShader> _pixelShaderAtestTexture;
 	ComPtr<ID3D11PixelShader> _pixelShaderAtestTextureNoAlpha;
 	ComPtr<ID3D11PixelShader> _pixelShaderSolid;
 	ComPtr<ID3D11RasterizerState> _rasterizerState;
-	ComPtr<ID3D11Buffer> _constantBuffer;
+	ComPtr<ID3D11Buffer> _vsConstantBuffer;
+	ComPtr<ID3D11Buffer> _gsConstantBuffer;
 
 	BOOL _useAnisotropy;
 	BOOL _useMultisampling;
@@ -91,4 +102,8 @@ public:
 	BackbufferSurface* _backbufferSurface;
 	FrontbufferSurface* _frontbufferSurface;
 	OffscreenSurface* _offscreenSurface;
+
+	// stereo
+	bool _isStereoEnabled;
+	void* _stereoHandle;
 };
