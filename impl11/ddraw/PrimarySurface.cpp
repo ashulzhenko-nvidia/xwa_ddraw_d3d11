@@ -389,13 +389,17 @@ HRESULT PrimarySurface::Flip(
 
 	if (this->_deviceResources->sceneRenderedEmpty)
 	{
-		this->_deviceResources->_d3dDeviceContext->ClearRenderTargetView(this->_deviceResources->_offscreenBufferView, this->_deviceResources->clearColor);
+		if (this->_deviceResources->_isStereoEnabled)
+			this->_deviceResources->_d3dDeviceContext->ClearRenderTargetView(this->_deviceResources->_offscreenBufferColorRTV, this->_deviceResources->clearColor);
+		else
+			this->_deviceResources->_d3dDeviceContext->ClearRenderTargetView(this->_deviceResources->_offscreenBufferRTV, this->_deviceResources->clearColor);
 		this->_deviceResources->clearColorSet = false;
-		this->_deviceResources->_d3dDeviceContext->ClearDepthStencilView(this->_deviceResources->_depthStencilView, D3D11_CLEAR_DEPTH, this->_deviceResources->clearDepth, 0);
-		this->_deviceResources->clearDepthSet = false;
 
-		const FLOAT clearLinearDepth[4] = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
-		this->_deviceResources->_d3dDeviceContext->ClearRenderTargetView(this->_deviceResources->_linearDepthRenderTargetView, clearLinearDepth);
+		if (this->_deviceResources->_isStereoEnabled)
+			this->_deviceResources->_d3dDeviceContext->ClearRenderTargetView(this->_deviceResources->_offscreenBufferDepthRTV, this->_deviceResources->_stereoContext.clearPackedDepth);
+
+		this->_deviceResources->_d3dDeviceContext->ClearDepthStencilView(this->_deviceResources->_depthStencilDSV, D3D11_CLEAR_DEPTH, this->_deviceResources->clearDepth, 0);
+		this->_deviceResources->clearDepthSet = false;
 	}
 
 	if (lpDDSurfaceTargetOverride != nullptr)

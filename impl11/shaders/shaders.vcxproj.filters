@@ -26,5 +26,11 @@
     <FxCompile Include="PixelShaderAtestTextureNoAlpha.hlsl" />
     <FxCompile Include="MainGeometryShader.hlsl" />
     <FxCompile Include="GeometryShader.hlsl" />
+    <FxCompile Include="VertexShaderUnpackDepth.hlsl" />
+    <FxCompile Include="PixelShaderUnpackDepth.hlsl" />
+    <FxCompile Include="PixelShaderUnpackDepthMS.hlsl" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="PixelShaderCommon.inc" />
   </ItemGroup>
 </Project>

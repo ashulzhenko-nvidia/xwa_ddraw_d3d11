@@ -8,6 +8,48 @@ class DepthSurface;
 class BackbufferSurface;
 class FrontbufferSurface;
 class OffscreenSurface;
+class Direct3DExecuteBuffer;
+class Direct3DTexture;
+
+struct Float4
+{
+	float x, y, z, w;
+};
+
+class DeviceResources;
+
+class StereoContext
+{
+public:
+	StereoContext(DeviceResources* owner);
+
+	void OnBeginFrame();
+	void OnChangeDepthState(const D3D11_DEPTH_STENCIL_DESC& depthDesc);
+	void OnDrawTriangles(const D3DTLVERTEX* vertices, const _D3DTRIANGLE* triangles, WORD triangleCount,
+		ID3D11PixelShader* currentPixelShader, Direct3DTexture* currentTexture);
+	void OnEndScene();
+
+	float clearPackedDepth[4];
+
+private:
+	DeviceResources* _owner;
+
+	// stereo fix
+	bool _depthWriteEnabled;
+	bool _depthTestEnabled;
+
+	float _frameConvergence;
+	float _frameSeparation;
+
+	bool _startedHUD = false;
+	bool _startedCrosshair = false;
+	bool _startedDepthUse = false;
+	bool _isFirstDrawCall = true;
+	bool _isMapMode = false;
+
+	friend class DeviceResources;
+};
+
 
 class DeviceResources
 {
@@ -48,14 +90,18 @@ public:
 	ComPtr<IDXGISwapChain> _swapChain;
 	ComPtr<IDXGIOutput> _output;
 	ComPtr<ID3D11Texture2D> _backBuffer;
-	ComPtr<ID3D11RenderTargetView> _backBufferView;
+	ComPtr<ID3D11RenderTargetView> _backBufferRTV;
 	ComPtr<ID3D11Texture2D> _offscreenBuffer;
-	ComPtr<ID3D11RenderTargetView> _offscreenBufferView;
+	ComPtr<ID3D11RenderTargetView> _offscreenBufferRTV;
+	ComPtr<ID3D11RenderTargetView> _offscreenBufferColorRTV;
+	ComPtr<ID3D11RenderTargetView> _offscreenBufferDepthRTV;
 	ComPtr<ID3D11Texture2D> _depthStencil;
-	ComPtr<ID3D11DepthStencilView> _depthStencilView;
+	ComPtr<ID3D11DepthStencilView> _depthStencilDSV;
+	ComPtr<ID3D11ShaderResourceView> _packedLinearDepthSRV;
 
-	ComPtr<ID3D11Texture2D> _linearDepthBuffer;
-	ComPtr<ID3D11RenderTargetView> _linearDepthRenderTargetView;
+	ComPtr<ID3D11Texture2D> _unpackedLinearDepth;
+	ComPtr<ID3D11RenderTargetView> _unpackedLinearDepthRTV;
+	ComPtr<ID3D11ShaderResourceView> _unpackedLinearDepthSRV;
 
 	ComPtr<ID3D11VertexShader> _mainVertexShader;
 	ComPtr<ID3D11InputLayout> _mainInputLayout;
@@ -70,6 +116,9 @@ public:
 	ComPtr<ID3D11Texture2D> _mainDisplayTexture;
 	ComPtr<ID3D11ShaderResourceView> _mainDisplayTextureView;
 
+	ComPtr<ID3D11VertexShader> _vertexShaderUnpackDepth;
+	ComPtr<ID3D11PixelShader> _pixelShaderUnpackDepth;
+
 	ComPtr<ID3D11VertexShader> _vertexShader;
 	ComPtr<ID3D11InputLayout> _inputLayout;
 	ComPtr<ID3D11GeometryShader> _geometryShader;
@@ -80,6 +129,7 @@ public:
 	ComPtr<ID3D11RasterizerState> _rasterizerState;
 	ComPtr<ID3D11Buffer> _vsConstantBuffer;
 	ComPtr<ID3D11Buffer> _gsConstantBuffer;
+
 
 	BOOL _useAnisotropy;
 	BOOL _useMultisampling;
@@ -106,4 +156,5 @@ public:
 	// stereo
 	bool _isStereoEnabled;
 	void* _stereoHandle;
+	StereoContext _stereoContext;
 };

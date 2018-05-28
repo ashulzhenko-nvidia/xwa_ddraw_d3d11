@@ -6,6 +6,9 @@
 #include "DeviceResources.h"
 #include "DirectDrawPalette.h"
 #include "PrimarySurface.h"
+#include "Direct3DExecuteBuffer.h"
+#include "Direct3DTexture.h"
+#include "TextureSurface.h"
 
 #include <nvapi.h>
 #include <nvapi_lite_stereo.h>
@@ -22,6 +25,9 @@
 #include "../Debug/PixelShaderSolid.h"
 #include "../Debug/MainGeometryShader.h"
 #include "../Debug/GeometryShader.h"
+#include "../Debug/VertexShaderUnpackDepth.h"
+#include "../Debug/PixelShaderUnpackDepth.h"
+#include "../Debug/PixelShaderUnpackDepthMS.h"
 #else
 #include "../Release/LanczosScalePixelShader.h"
 #include "../Release/MainVertexShader.h"
@@ -34,6 +40,9 @@
 #include "../Release/PixelShaderSolid.h"
 #include "../Release/MainGeometryShader.h"
 #include "../Release/GeometryShader.h"
+#include "../Release/VertexShaderUnpackDepth.h"
+#include "../Release/PixelShaderUnpackDepth.h"
+#include "../Release/PixelShaderUnpackDepthMS.h"
 #endif
 
 struct MainVertex
@@ -59,6 +68,7 @@ struct MainVertex
 };
 
 DeviceResources::DeviceResources()
+	: _stereoContext(this)
 {
 	this->_displayWidth = 0;
 	this->_displayHeight = 0;
@@ -194,13 +204,16 @@ HRESULT DeviceResources::OnSizeChanged(HWND hWnd, DWORD dwWidth, DWORD dwHeight)
 	HRESULT hr;
 	const char* step = "";
 
-	this->_linearDepthRenderTargetView.Release();
-	this->_linearDepthBuffer.Release();
-	this->_depthStencilView.Release();
+	this->_depthStencilDSV.Release();
 	this->_depthStencil.Release();
-	this->_offscreenBufferView.Release();
+	if (_isStereoEnabled)
+	{
+		this->_offscreenBufferDepthRTV.Release();
+		this->_offscreenBufferColorRTV.Release();
+	}
+	this->_offscreenBufferRTV.Release();
 	this->_offscreenBuffer.Release();
-	this->_backBufferView.Release();
+	this->_backBufferRTV.Release();
 	this->_backBuffer.Release();
 	// Releasing a swap chain is only allowed after switching
 	// to windowed mode.
@@ -315,11 +328,7 @@ HRESULT DeviceResources::OnSizeChanged(HWND hWnd, DWORD dwWidth, DWORD dwHeight)
 	if (SUCCEEDED(hr))
 	{
 		step = "BackBufferView";
-		D3D11_RENDER_TARGET_VIEW_DESC backBufferViewDesc;
-		backBufferViewDesc.Format = DXGI_FORMAT_UNKNOWN;
-		backBufferViewDesc.Texture2D.MipSlice = 0;
-		backBufferViewDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-		hr = this->_d3dDevice->CreateRenderTargetView(this->_backBuffer, &backBufferViewDesc, &this->_backBufferView);
+		hr = this->_d3dDevice->CreateRenderTargetView(this->_backBuffer, nullptr, &this->_backBufferRTV);
 	}
 
 	if (SUCCEEDED(hr))
@@ -328,11 +337,11 @@ HRESULT DeviceResources::OnSizeChanged(HWND hWnd, DWORD dwWidth, DWORD dwHeight)
 
 		CD3D11_TEXTURE2D_DESC desc(
 			DXGI_FORMAT_B8G8R8A8_UNORM,
-			this->_backbufferWidth * (1 + _isStereoEnabled),
+			this->_backbufferWidth,
 			this->_backbufferHeight,
+			1 + _isStereoEnabled * 2,
 			1,
-			1,
-			D3D11_BIND_RENDER_TARGET,
+			D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
 			D3D11_USAGE_DEFAULT,
 			0,
 			this->_sampleDesc.Count,
@@ -345,21 +354,125 @@ HRESULT DeviceResources::OnSizeChanged(HWND hWnd, DWORD dwWidth, DWORD dwHeight)
 	if (SUCCEEDED(hr))
 	{
 		step = "OffscreenBufferView";
-		D3D11_RENDER_TARGET_VIEW_DESC offscreenBufferViewDesc;
-		offscreenBufferViewDesc.Format = DXGI_FORMAT_UNKNOWN;
-		offscreenBufferViewDesc.Texture2D.MipSlice = 0;
-		offscreenBufferViewDesc.ViewDimension = this->_useMultisampling ? D3D11_RTV_DIMENSION_TEXTURE2DMS : D3D11_RTV_DIMENSION_TEXTURE2D;
-		hr = this->_d3dDevice->CreateRenderTargetView(this->_offscreenBuffer, &offscreenBufferViewDesc, &this->_offscreenBufferView);
+
+		hr = this->_d3dDevice->CreateRenderTargetView(this->_offscreenBuffer, nullptr, &this->_offscreenBufferRTV);
+	}
+
+	if (_isStereoEnabled)
+	{
+		if (SUCCEEDED(hr))
+		{
+			step = "OffscreenBufferColorView";
+
+			D3D11_RENDER_TARGET_VIEW_DESC desc;
+			desc.Format = DXGI_FORMAT_UNKNOWN;
+			if (this->_sampleDesc.Count > 1)
+			{
+				desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY;
+				desc.Texture2DMSArray.FirstArraySlice = 0;
+				desc.Texture2DMSArray.ArraySize = 2;
+			}
+			else
+			{
+				desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+				desc.Texture2DArray.MipSlice = 0;
+				desc.Texture2DArray.FirstArraySlice = 0;
+				desc.Texture2DArray.ArraySize = 2;
+			}
+
+			hr = this->_d3dDevice->CreateRenderTargetView(this->_offscreenBuffer, &desc, &this->_offscreenBufferColorRTV);
+		}
+
+		if (SUCCEEDED(hr))
+		{
+			step = "OffscreenBufferDepthView";
+
+			D3D11_RENDER_TARGET_VIEW_DESC desc;
+			desc.Format = DXGI_FORMAT_UNKNOWN;
+			if (this->_sampleDesc.Count > 1)
+			{
+				desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY;
+				desc.Texture2DMSArray.FirstArraySlice = 2;
+				desc.Texture2DMSArray.ArraySize = 1;
+			}
+			else
+			{
+				desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+				desc.Texture2DArray.MipSlice = 0;
+				desc.Texture2DArray.FirstArraySlice = 2;
+				desc.Texture2DArray.ArraySize = 1;
+			}
+
+			hr = this->_d3dDevice->CreateRenderTargetView(this->_offscreenBuffer, &desc, &this->_offscreenBufferDepthRTV);
+		}
+
+		if (SUCCEEDED(hr))
+		{
+			step = "PackedLinearDepthSRV";
+
+			D3D11_SHADER_RESOURCE_VIEW_DESC textureViewDesc{};
+			textureViewDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+			if (this->_sampleDesc.Count > 1)
+			{
+				textureViewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY;
+				textureViewDesc.Texture2DMSArray.FirstArraySlice = 2;
+				textureViewDesc.Texture2DMSArray.ArraySize = 1;
+			}
+			else
+			{
+				textureViewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+				textureViewDesc.Texture2DArray.MostDetailedMip = 0;
+				textureViewDesc.Texture2DArray.MipLevels = 1;
+				textureViewDesc.Texture2DArray.FirstArraySlice = 2;
+				textureViewDesc.Texture2DArray.ArraySize = 1;
+			}
+
+			hr = this->_d3dDevice->CreateShaderResourceView(this->_offscreenBuffer, &textureViewDesc, &this->_packedLinearDepthSRV);
+		}
+
+		if (SUCCEEDED(hr))
+		{
+			step = "UnpackedLinearDepth";
+
+			CD3D11_TEXTURE2D_DESC desc(
+				DXGI_FORMAT_R32_FLOAT,
+				this->_backbufferWidth,
+				this->_backbufferHeight,
+				1,
+				1,
+				D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
+				D3D11_USAGE_DEFAULT,
+				0,
+				1,
+				0,
+				0);
+
+			hr = this->_d3dDevice->CreateTexture2D(&desc, nullptr, &this->_unpackedLinearDepth);
+		}
+
+		if (SUCCEEDED(hr))
+		{
+			step = "UnpackedLinearDepthRTV";
+
+			hr = this->_d3dDevice->CreateRenderTargetView(this->_unpackedLinearDepth, nullptr, &this->_unpackedLinearDepthRTV);
+		}
+
+		if (SUCCEEDED(hr))
+		{
+			step = "UnpackedLinearDepthSRV";
+
+			hr = this->_d3dDevice->CreateShaderResourceView(this->_unpackedLinearDepth, nullptr, &this->_unpackedLinearDepthSRV);
+		}
 	}
 
 	if (SUCCEEDED(hr))
 	{
 		step = "DepthStencil";
 		D3D11_TEXTURE2D_DESC depthStencilDesc;
-		depthStencilDesc.Width = this->_backbufferWidth * (1 + _isStereoEnabled);
+		depthStencilDesc.Width = this->_backbufferWidth;
 		depthStencilDesc.Height = this->_backbufferHeight;
 		depthStencilDesc.MipLevels = 1;
-		depthStencilDesc.ArraySize = 1;
+		depthStencilDesc.ArraySize = 1 + _isStereoEnabled * 2;
 		depthStencilDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
 		depthStencilDesc.SampleDesc.Count = this->_sampleDesc.Count;
 		depthStencilDesc.SampleDesc.Quality = this->_sampleDesc.Quality;
@@ -373,51 +486,15 @@ HRESULT DeviceResources::OnSizeChanged(HWND hWnd, DWORD dwWidth, DWORD dwHeight)
 		if (SUCCEEDED(hr))
 		{
 			step = "DepthStencilView";
-			D3D11_DEPTH_STENCIL_VIEW_DESC depthStencilViewDesc;
-			depthStencilViewDesc.Format = DXGI_FORMAT_UNKNOWN;
-			depthStencilViewDesc.Flags = 0;
-			depthStencilViewDesc.Texture2D.MipSlice = 0;
-			depthStencilViewDesc.ViewDimension = this->_useMultisampling ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
-			hr = this->_d3dDevice->CreateDepthStencilView(this->_depthStencil, &depthStencilViewDesc, &this->_depthStencilView);
+			hr = this->_d3dDevice->CreateDepthStencilView(this->_depthStencil, nullptr, &this->_depthStencilDSV);
 		}
-	}
-
-	if (SUCCEEDED(hr))
-	{
-		step = "LinearDepthBuffer";
-
-		CD3D11_TEXTURE2D_DESC desc(
-			DXGI_FORMAT_R32_FLOAT,
-			this->_backbufferWidth,
-			this->_backbufferHeight,
-			1,
-			1,
-			D3D11_BIND_RENDER_TARGET,
-			D3D11_USAGE_DEFAULT,
-			0,
-			this->_sampleDesc.Count,
-			this->_sampleDesc.Quality,
-			0);
-
-		hr = this->_d3dDevice->CreateTexture2D(&desc, nullptr, &this->_linearDepthBuffer);
-	}
-
-	if (SUCCEEDED(hr))
-	{
-		step = "LinearDepthRenderTargetView";
-		D3D11_RENDER_TARGET_VIEW_DESC renderTargetViewDesc;
-		renderTargetViewDesc.Format = DXGI_FORMAT_UNKNOWN;
-		renderTargetViewDesc.Texture2D.MipSlice = 0;
-		renderTargetViewDesc.ViewDimension = this->_useMultisampling ? D3D11_RTV_DIMENSION_TEXTURE2DMS : D3D11_RTV_DIMENSION_TEXTURE2D;
-		hr = this->_d3dDevice->CreateRenderTargetView(this->_linearDepthBuffer, &renderTargetViewDesc, &this->_linearDepthRenderTargetView);
 	}
 
 	if (SUCCEEDED(hr))
 	{
 		step = "Viewport";
 
-		ID3D11RenderTargetView* renderTargets[] = { this->_offscreenBufferView.Get() };
-		this->_d3dDeviceContext->OMSetRenderTargets(1, renderTargets, this->_depthStencilView.Get());
+		this->_d3dDeviceContext->OMSetRenderTargets(1, this->_offscreenBufferRTV.GetAddressOf(), this->_depthStencilDSV.Get());
 
 		D3D11_VIEWPORT viewport;
 		viewport.TopLeftX = 0;
@@ -651,12 +728,6 @@ HRESULT DeviceResources::LoadResources()
 	if (FAILED(hr = this->_d3dDevice->CreateInputLayout(vertexLayoutDesc, ARRAYSIZE(vertexLayoutDesc), g_VertexShader, sizeof(g_VertexShader), &_inputLayout)))
 		return hr;
 
-	if (_isStereoEnabled)
-	{
-		if (FAILED(hr = this->_d3dDevice->CreateGeometryShader(g_GeometryShader, sizeof(g_GeometryShader), nullptr, &_geometryShader)))
-			return hr;
-	}
-
 	if (FAILED(hr = this->_d3dDevice->CreatePixelShader(g_PixelShaderTexture, sizeof(g_PixelShaderTexture), nullptr, &_pixelShaderTexture)))
 		return hr;
 
@@ -668,6 +739,27 @@ HRESULT DeviceResources::LoadResources()
 
 	if (FAILED(hr = this->_d3dDevice->CreatePixelShader(g_PixelShaderSolid, sizeof(g_PixelShaderSolid), nullptr, &_pixelShaderSolid)))
 		return hr;
+
+	// shaders for stereo
+	if (_isStereoEnabled)
+	{
+		if (FAILED(hr = this->_d3dDevice->CreateGeometryShader(g_GeometryShader, sizeof(g_GeometryShader), nullptr, &_geometryShader)))
+			return hr;
+
+		if (FAILED(hr = this->_d3dDevice->CreateVertexShader(g_VertexShaderUnpackDepth, sizeof(g_VertexShaderUnpackDepth), nullptr, &_vertexShaderUnpackDepth)))
+			return hr;
+
+		if (_sampleDesc.Count > 1)
+		{
+			if (FAILED(hr = this->_d3dDevice->CreatePixelShader(g_PixelShaderUnpackDepthMS, sizeof(g_PixelShaderUnpackDepthMS), nullptr, &_pixelShaderUnpackDepth)))
+				return hr;
+		}
+		else
+		{
+			if (FAILED(hr = this->_d3dDevice->CreatePixelShader(g_PixelShaderUnpackDepth, sizeof(g_PixelShaderUnpackDepth), nullptr, &_pixelShaderUnpackDepth)))
+				return hr;
+		}
+	}
 
 	D3D11_RASTERIZER_DESC rsDesc;
 	rsDesc.FillMode = g_config.WireframeFillMode ? D3D11_FILL_WIREFRAME : D3D11_FILL_SOLID;
@@ -685,7 +777,7 @@ HRESULT DeviceResources::LoadResources()
 		return hr;
 
 	D3D11_BUFFER_DESC vsConstantBufferDesc;
-	vsConstantBufferDesc.ByteWidth = 32;
+	vsConstantBufferDesc.ByteWidth = 16;
 	vsConstantBufferDesc.Usage = D3D11_USAGE_DEFAULT;
 	vsConstantBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 	vsConstantBufferDesc.CPUAccessFlags = 0;
@@ -698,7 +790,7 @@ HRESULT DeviceResources::LoadResources()
 	if (_isStereoEnabled)
 	{
 		D3D11_BUFFER_DESC gsConstantBufferDesc;
-		gsConstantBufferDesc.ByteWidth = 16;
+		gsConstantBufferDesc.ByteWidth = 16 * 4;
 		gsConstantBufferDesc.Usage = D3D11_USAGE_DEFAULT;
 		gsConstantBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 		gsConstantBufferDesc.CPUAccessFlags = 0;
@@ -1156,7 +1248,7 @@ void DeviceResources::CheckMultisamplingSupport()
 
 	if (supported)
 	{
-		for (UINT i = 2; i <= D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT; i *= 2)
+		for (UINT i = 4; i <= D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT; i *= 2)
 		{
 			UINT numQualityLevels = 0;
 
@@ -1198,13 +1290,46 @@ void DeviceResources::ResolveBackBuffer()
 {
 	if (_isStereoEnabled)
 	{
-		NvAPI_Stereo_SetActiveEye(_stereoHandle, NVAPI_STEREO_EYE_LEFT);
-		D3D11_BOX srcBoxLeft = { 0, 0, 0, _backbufferWidth, _backbufferHeight, 1 };
-		_d3dDeviceContext->CopySubresourceRegion(_backBuffer, 0, 0, 0, 0, _offscreenBuffer, 0, &srcBoxLeft);
+#if 0
+		if (::GetAsyncKeyState('D'))
+		{
+			NvAPI_Stereo_SetActiveEye(_stereoHandle, NVAPI_STEREO_EYE_MONO);
 
-		NvAPI_Stereo_SetActiveEye(_stereoHandle, NVAPI_STEREO_EYE_RIGHT);
-		D3D11_BOX srcBoxRight = { _backbufferWidth, 0, 0, _backbufferWidth * 2, _backbufferHeight, 1 };
-		_d3dDeviceContext->CopySubresourceRegion(_backBuffer, 0, 0, 0, 0, _offscreenBuffer, 0, &srcBoxRight);
+			this->_d3dDeviceContext->OMSetRenderTargets(1, this->_backBufferRTV.GetAddressOf(), nullptr);
+
+			this->_d3dDeviceContext->IASetInputLayout(this->_mainInputLayout);
+			this->_d3dDeviceContext->VSSetShader(this->_mainVertexShader, nullptr, 0);
+			this->_d3dDeviceContext->GSSetShader(nullptr, nullptr, 0);
+			this->_d3dDeviceContext->PSSetShader(this->_mainPixelShaderDebugDepth, nullptr, 0);
+			this->_d3dDeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+			this->_d3dDeviceContext->RSSetState(this->_mainRasterizerState);
+			this->_d3dDeviceContext->PSSetSamplers(0, 1, this->_mainSamplerState.GetAddressOf());
+
+			const FLOAT factors[] = { 0.0f, 0.0f, 0.0f, 0.0f };
+			UINT mask = 0xffffffff;
+			this->_d3dDeviceContext->OMSetBlendState(this->_mainBlendState, factors, mask);
+			this->_d3dDeviceContext->OMSetDepthStencilState(this->_mainDepthState, 0);
+
+			this->_d3dDeviceContext->PSSetShaderResources(0, 1, this->_packedLinearDepthSRV.GetAddressOf());
+
+			UINT stride = sizeof(MainVertex);
+			UINT offset = 0;
+			this->_d3dDeviceContext->IASetVertexBuffers(0, 1, this->_mainVertexBuffer.GetAddressOf(), &stride, &offset);
+			this->_d3dDeviceContext->IASetIndexBuffer(this->_mainIndexBuffer, DXGI_FORMAT_R16_UINT, 0);
+			this->_d3dDeviceContext->DrawIndexed(6, 0, 0);
+
+			this->_d3dDeviceContext->OMSetRenderTargets(1, this->_offscreenBufferRTV.GetAddressOf(), this->_depthStencilDSV.Get());
+		}
+		else
+#endif
+		{
+			NvAPI_Stereo_SetActiveEye(_stereoHandle, NVAPI_STEREO_EYE_LEFT);
+			_d3dDeviceContext->ResolveSubresource(_backBuffer, 0, _offscreenBuffer, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+
+			NvAPI_Stereo_SetActiveEye(_stereoHandle, NVAPI_STEREO_EYE_RIGHT);
+			_d3dDeviceContext->ResolveSubresource(_backBuffer, 0, _offscreenBuffer, 1, DXGI_FORMAT_B8G8R8A8_UNORM);
+		}
 	}
 	else
 	{
@@ -1247,15 +1372,241 @@ void DeviceResources::SetViewport(DWORD width, DWORD height)
 	viewport.MinDepth = D3D11_MIN_DEPTH;
 	viewport.MaxDepth = D3D11_MAX_DEPTH;
 
-	if (_isStereoEnabled)
-	{
-		D3D11_VIEWPORT viewports[2] = { viewport, viewport };
-		viewports[1].TopLeftX += _backbufferWidth;
+	this->_d3dDeviceContext->RSSetViewports(1, &viewport);
+}
 
-		this->_d3dDeviceContext->RSSetViewports(2, viewports);
+StereoContext::StereoContext(DeviceResources* owner)
+	: _owner(owner)
+{
+	// Set _clearPackedDepth
+	{
+		const FLOAT fDepth = INFINITY; //+inf
+		const DWORD dwDepth = *(DWORD*)&fDepth;
+		clearPackedDepth[0] = (dwDepth & 255) / 255.0f;
+		clearPackedDepth[1] = ((dwDepth >> 8) & 255) / 255.0f;
+		clearPackedDepth[2] = ((dwDepth >> 16) & 255) / 255.0f;
+		clearPackedDepth[3] = ((dwDepth >> 24)) / 255.0f;
+	}
+
+	_startedHUD = false;
+	_startedDepthUse = false;
+}
+
+void StereoContext::OnBeginFrame()
+{
+	_depthWriteEnabled = false;
+	_depthTestEnabled = false;
+
+	NvAPI_Stereo_GetConvergence(_owner->_stereoHandle, &_frameConvergence);
+
+	float separationPercentage = 0;
+	float eyeSeparation = 0;
+	NvAPI_Stereo_GetSeparation(_owner->_stereoHandle, &separationPercentage);
+	NvAPI_Stereo_GetEyeSeparation(_owner->_stereoHandle, &eyeSeparation);
+
+	_frameSeparation = eyeSeparation * separationPercentage / 100;
+}
+
+void StereoContext::OnChangeDepthState(const D3D11_DEPTH_STENCIL_DESC& depthDesc)
+{
+	_depthWriteEnabled = (depthDesc.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO);
+	_depthTestEnabled = (depthDesc.DepthFunc != D3D11_COMPARISON_ALWAYS);
+}
+
+void StereoContext::OnDrawTriangles(const D3DTLVERTEX* vertices, const _D3DTRIANGLE* triangles, WORD triangleCount,
+	ID3D11PixelShader* currentPixelShader, Direct3DTexture* currentTexture)
+{
+	D3DTLVERTEX vMin, vMax;
+	vMin.sx = vMin.sy = vMin.sz = +FLT_MAX;
+	vMax.sx = vMax.sy = vMax.sz = -FLT_MAX;
+
+	bool hasAllWhiteColor = true;
+	bool hasUV_1_0 = true;
+	bool hasUV_0_or_1 = true;
+
+	auto processVertex = [&](WORD index) {
+		const D3DTLVERTEX& v = vertices[index];
+		const float z = 1.0f / v.rhw;
+		vMin.sx = min(vMin.sx, v.sx); vMin.sy = min(vMin.sy, v.sy); vMin.sz = min(vMin.sz, z);
+		vMax.sx = max(vMax.sx, v.sx); vMax.sy = max(vMax.sy, v.sy); vMax.sz = max(vMax.sz, z);
+
+		hasAllWhiteColor &= ((v.color == 0xFFFFFFFF) | (v.color == 0xFEFFFFFF));
+		hasUV_1_0 &= ((v.tu == 1.0f) & (v.tv == 0.0f));
+		hasUV_0_or_1 &= ((v.tu == 0.0f) | (v.tu == 1.0f)) & ((v.tv == 0.0f) | (v.tv == 1.0f));
+	};
+
+	for (WORD i = 0; i < triangleCount; i++)
+	{
+		processVertex(triangles->v1);
+		processVertex(triangles->v2);
+		processVertex(triangles->v3);
+		++triangles;
+	}
+
+	const float centerX = ((vMin.sx + vMax.sx) / _owner->_backbufferWidth) - 1.0f;
+	const float centerY = ((vMin.sy + vMax.sy) / _owner->_backbufferHeight) - 1.0f;
+	const float centerZ = (vMin.sz + vMax.sz) * 0.5f;
+
+	const float extentX = (vMax.sx - vMin.sx) / _owner->_backbufferWidth;
+	const float extentY = (vMax.sy - vMin.sy) / _owner->_backbufferHeight;
+	const float extentZ = (vMax.sz - vMin.sz) * 0.5f;
+
+	const float centerXY = max(abs(centerX), abs(centerY));
+	const float extentXY = max(extentX, extentY);
+
+	//fix stereo logic
+	const bool isSolid = (currentPixelShader == _owner->_pixelShaderSolid);
+	const bool isDepthDisabled = !_depthWriteEnabled & !_depthTestEnabled;
+	const bool isFlat = isDepthDisabled & (extentZ == 0.0);
+	const bool isOnScreen = (abs(centerZ - 1.0f) < 0.001f);
+	const bool isHUD = isFlat & ((int(centerZ) == 65535) | isOnScreen) & !isSolid;
+
+	const bool isBackground = isDepthDisabled & !isHUD;
+	const bool isSelection = (extentZ == 0.0) & isSolid;
+	const bool isHyperSpace = !isDepthDisabled & hasAllWhiteColor & hasUV_1_0;
+	const bool isInside = !isDepthDisabled & (vMax.sz < 0.5f);
+
+	bool isFlare = isFlat & isOnScreen & !isSolid & hasAllWhiteColor & hasUV_0_or_1;
+	if (isFlare)
+	{
+		//check texture to be 64 x 64
+		isFlare &= (currentTexture && currentTexture->_surface &&
+			((currentTexture->_surface->_width == 64) & (currentTexture->_surface->_height == 64)));
+	}
+
+	_startedHUD |= isHUD;
+
+	if (_isFirstDrawCall)
+	{
+		_isMapMode = !isBackground;
+		_isFirstDrawCall = false;
+	}
+	if (isHyperSpace)
+	{
+		_isMapMode = false;
+	}
+
+	float convergence = _frameConvergence;
+	float separation = _frameSeparation;
+
+	float mode = 0;
+	float depthScale = 1.0f;
+
+	if (_isMapMode)
+	{
+		// make all mono!
+		separation = convergence = 0.0f;
 	}
 	else
 	{
-		this->_d3dDeviceContext->RSSetViewports(1, &viewport);
+		if (isInside)
+		{
+			depthScale = 30 * _frameConvergence;
+		}
+		else
+		{
+			if (isSelection) mode = 2;
+			if (isHUD & !isFlare) mode = 1;
+
+			if (mode == 0)
+			{
+				if (isBackground | isHyperSpace | isFlare | isSelection)
+				{
+					//move to infinity
+					convergence = 0.0f;
+					depthScale = 1024.0f * 1024.0f;
+				}
+				else
+				if (_startedHUD)
+				{
+					//move to screen (convergence) depth = make mono
+					separation = convergence = 0.0f;
+				}
+			}
+		}
+
+		if (isSelection & !_startedDepthUse)
+		{
+			_startedDepthUse = true;
+
+			// unpack linear depth
+			_owner->_d3dDeviceContext->OMSetRenderTargets(1, _owner->_unpackedLinearDepthRTV.GetAddressOf(), nullptr);
+
+			UINT savedStencilRef;
+			ID3D11DepthStencilState* savedDepthState;
+			_owner->_d3dDeviceContext->OMGetDepthStencilState(&savedDepthState, &savedStencilRef);
+
+			_owner->_d3dDeviceContext->OMSetDepthStencilState(_owner->_mainDepthState, 0);
+
+			FLOAT savedBlendFactors[4];
+			UINT savedBlendMask;
+			ID3D11BlendState* savedBlendState = nullptr;
+			_owner->_d3dDeviceContext->OMGetBlendState(&savedBlendState, savedBlendFactors, &savedBlendMask);
+
+			const FLOAT blendFactors[] = { 0.0f, 0.0f, 0.0f, 0.0f };
+			const UINT blendMask = 0xffffffff;
+			_owner->_d3dDeviceContext->OMSetBlendState(_owner->_mainBlendState, blendFactors, blendMask);
+
+			_owner->_d3dDeviceContext->VSSetShader(_owner->_vertexShaderUnpackDepth, nullptr, 0);
+			_owner->_d3dDeviceContext->GSSetShader(nullptr, nullptr, 0);
+			_owner->_d3dDeviceContext->PSSetShader(_owner->_pixelShaderUnpackDepth, nullptr, 0);
+
+			ID3D11ShaderResourceView* savedSRV = nullptr;
+			_owner->_d3dDeviceContext->PSGetShaderResources(0, 1, &savedSRV);
+			_owner->_d3dDeviceContext->PSSetShaderResources(0, 1, _owner->_packedLinearDepthSRV.GetAddressOf());
+
+			_owner->_d3dDeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+			_owner->_d3dDeviceContext->Draw(4, 0);
+
+			// restore render state
+			_owner->_d3dDeviceContext->OMSetRenderTargets(1, _owner->_offscreenBufferRTV.GetAddressOf(), _owner->_depthStencilDSV.Get());
+
+			_owner->_d3dDeviceContext->OMSetDepthStencilState(savedDepthState, savedStencilRef);
+			if (savedDepthState) savedDepthState->Release();
+
+			_owner->_d3dDeviceContext->OMSetBlendState(savedBlendState, savedBlendFactors, savedBlendMask);
+			if (savedBlendState) savedBlendState->Release();
+
+			_owner->_d3dDeviceContext->VSSetShader(_owner->_vertexShader, nullptr, 0);
+			_owner->_d3dDeviceContext->GSSetShader(_owner->_geometryShader, nullptr, 0);
+			_owner->_d3dDeviceContext->PSSetShader(currentPixelShader, nullptr, 0);
+			_owner->_d3dDeviceContext->PSSetShaderResources(0, 1, &savedSRV);
+			if (savedSRV) savedSRV->Release();
+
+			_owner->_d3dDeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		}
+
+		if (isSelection)
+		{
+			// pass unpacked linear depth to GS
+			_owner->_d3dDeviceContext->GSSetShaderResources(0, 1, _owner->_unpackedLinearDepthSRV.GetAddressOf());
+		}
+		else
+		{
+			ID3D11ShaderResourceView* nullSRV = nullptr;
+			_owner->_d3dDeviceContext->GSSetShaderResources(0, 1, &nullSRV);
+		}
 	}
+
+	struct GeomConstBufferData
+	{
+		Float4 stereoParamsArray[3];
+		Float4 objCenter;
+	} geomConstBufferData;
+
+	geomConstBufferData.stereoParamsArray[0] = Float4{ -separation, convergence, mode, depthScale };
+	geomConstBufferData.stereoParamsArray[1] = Float4{ +separation, convergence, mode, depthScale };
+	geomConstBufferData.stereoParamsArray[2] = Float4{ 0, 0, mode, depthScale };
+	geomConstBufferData.objCenter = Float4{ (vMin.sx + vMax.sx) * 0.5f, (vMin.sy + vMax.sy) * 0.5f, (vMin.sz + vMax.sz) * 0.5f, 0 };
+
+	_owner->_d3dDeviceContext->UpdateSubresource(_owner->_gsConstantBuffer, 0, nullptr, &geomConstBufferData, 0, 0);
+	_owner->_d3dDeviceContext->GSSetConstantBuffers(0, 1, _owner->_gsConstantBuffer.GetAddressOf());
+}
+
+void StereoContext::OnEndScene()
+{
+	_startedHUD = false;
+	_startedDepthUse = false;
+	_isFirstDrawCall = true;
+	_isMapMode = false;
 }

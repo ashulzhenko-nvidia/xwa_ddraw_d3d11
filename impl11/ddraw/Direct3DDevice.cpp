@@ -619,32 +619,8 @@ HRESULT Direct3DDevice::Execute(
 
 	if (this->_deviceResources->_isStereoEnabled)
 	{
-		struct GeomConstBufferData
-		{
-			float stereoParams[4];
-		} geomConstBufferData;
-
-		float convergence = 0;
-		float separationPercentage = 0;
-		float eyeSeparation = 0;
-
-		NvAPI_Stereo_GetConvergence(this->_deviceResources->_stereoHandle, &convergence);
-		NvAPI_Stereo_GetSeparation(this->_deviceResources->_stereoHandle, &separationPercentage);
-		NvAPI_Stereo_GetEyeSeparation(this->_deviceResources->_stereoHandle, &eyeSeparation);
-
-		geomConstBufferData.stereoParams[0] = eyeSeparation * separationPercentage / 100;
-		geomConstBufferData.stereoParams[1] = convergence;
-
-		context->UpdateSubresource(this->_deviceResources->_gsConstantBuffer, 0, nullptr, &geomConstBufferData, 0, 0);
-		context->GSSetConstantBuffers(0, 1, this->_deviceResources->_gsConstantBuffer.GetAddressOf());
+		this->_deviceResources->_stereoContext.OnBeginFrame();
 	}
-
-	struct ConstBufferData
-	{
-		float viewportScale[4];
-		float centerAndExtent[4];
-	};
-	ConstBufferData constBufferData;
 
 	if (SUCCEEDED(hr))
 	{
@@ -667,10 +643,15 @@ HRESULT Direct3DDevice::Execute(
 			scale *= g_config.Concourse3DScale;
 		}
 
-		constBufferData.viewportScale[0] = 2.0f / (float)this->_deviceResources->_displayWidth;
-		constBufferData.viewportScale[1] = -2.0f / (float)this->_deviceResources->_displayHeight;
-		constBufferData.viewportScale[2] = scale;
-		constBufferData.viewportScale[3] = 0;
+		struct ConstBufferData
+		{
+			Float4 viewportScale;
+		};
+		ConstBufferData constBufferData;
+		constBufferData.viewportScale = { 2.0f / (float)this->_deviceResources->_displayWidth, -2.0f / (float)this->_deviceResources->_displayHeight, scale, 0 };
+
+		context->UpdateSubresource(this->_deviceResources->_vsConstantBuffer, 0, nullptr, &constBufferData, 0, 0);
+		context->VSSetConstantBuffers(0, 1, this->_deviceResources->_vsConstantBuffer.GetAddressOf());
 	}
 
 	if (SUCCEEDED(hr))
@@ -882,40 +863,17 @@ HRESULT Direct3DDevice::Execute(
 
 					this->_renderStates->DepthStencilDescChanged = false;
 
-					constBufferData.viewportScale[3] = (depthDesc.DepthFunc == D3D11_COMPARISON_ALWAYS && depthDesc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO) ? 1.0f : 0.0f;
+					if (this->_deviceResources->_isStereoEnabled)
+					{
+						this->_deviceResources->_stereoContext.OnChangeDepthState(depthDesc);
+					}
 				}
 
-				// calculate objectCenter
+				if (this->_deviceResources->_isStereoEnabled)
 				{
-					const D3DTLVERTEX* vertices = (D3DTLVERTEX*)executeBuffer->_buffer;
-
-					D3DTLVERTEX vMin, vMax;
-					vMin.sx = vMin.sy = vMin.sz = +FLT_MAX;
-					vMax.sx = vMax.sy = vMax.sz = -FLT_MAX;
-					
-					auto processVertex = [&](WORD index) {
-						const D3DTLVERTEX& v = vertices[index];
-						const float z = 1.0f / v.rhw;
-						vMin.sx = min(vMin.sx, v.sx); vMin.sy = min(vMin.sy, v.sy); vMin.sz = min(vMin.sz, z);
-						vMax.sx = max(vMax.sx, v.sx); vMax.sy = max(vMax.sy, v.sy); vMax.sz = max(vMax.sz, z);
-					};
-
-					LPD3DTRIANGLE triangle = (LPD3DTRIANGLE)(instruction + 1);
-					for (WORD i = 0; i < instruction->wCount; i++)
-					{
-						processVertex(triangle->v1);
-						processVertex(triangle->v2);
-						processVertex(triangle->v3);
-						++triangle;
-					}
-
-					constBufferData.centerAndExtent[0] = (vMin.sx + vMax.sx) * 0.5f;
-					constBufferData.centerAndExtent[1] = (vMin.sy + vMax.sy) * 0.5f;
-					constBufferData.centerAndExtent[2] = (vMin.sz + vMax.sz) * 0.5f;
-					constBufferData.centerAndExtent[3] = (vMax.sz - vMin.sz) * 0.5f;
-
-					context->UpdateSubresource(this->_deviceResources->_vsConstantBuffer, 0, nullptr, &constBufferData, 0, 0);
-					context->VSSetConstantBuffers(0, 1, this->_deviceResources->_vsConstantBuffer.GetAddressOf());
+					this->_deviceResources->_stereoContext.OnDrawTriangles(
+						(D3DTLVERTEX*)executeBuffer->_buffer, (LPD3DTRIANGLE)(instruction + 1), instruction->wCount, 
+						currentPixelShader, currentTexture);
 				}
 
 				step = "Draw";
@@ -1232,7 +1190,7 @@ HRESULT Direct3DDevice::BeginScene()
 	LogText(str.str());
 #endif
 
-	if (!this->_deviceResources->_offscreenBufferView)
+	if (!this->_deviceResources->_offscreenBufferRTV)
 	{
 #if LOGGER
 		str.str("\tD3DERR_SCENE_BEGIN_FAILED");
@@ -1250,16 +1208,20 @@ HRESULT Direct3DDevice::BeginScene()
 	if (!this->_deviceResources->sceneRendered || this->_deviceResources->clearColorSet)
 	{
 		// Clear only directly after flip
-		context->ClearRenderTargetView(this->_deviceResources->_offscreenBufferView, this->_deviceResources->clearColor);
+		if (this->_deviceResources->_isStereoEnabled)
+			context->ClearRenderTargetView(this->_deviceResources->_offscreenBufferColorRTV, this->_deviceResources->clearColor);
+		else
+			context->ClearRenderTargetView(this->_deviceResources->_offscreenBufferRTV, this->_deviceResources->clearColor);
+
 		this->_deviceResources->clearColorSet = false;
 	}
 	if (!this->_deviceResources->sceneRendered || this->_deviceResources->clearDepthSet)
 	{
-	    context->ClearDepthStencilView(this->_deviceResources->_depthStencilView, D3D11_CLEAR_DEPTH, this->_deviceResources->clearDepth, 0);
-		this->_deviceResources->clearDepthSet = false;
+		if (this->_deviceResources->_isStereoEnabled)
+			context->ClearRenderTargetView(this->_deviceResources->_offscreenBufferDepthRTV, this->_deviceResources->_stereoContext.clearPackedDepth);
 
-		const FLOAT clearLinearDepth[4] = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
-		context->ClearRenderTargetView(this->_deviceResources->_linearDepthRenderTargetView, clearLinearDepth);
+	    context->ClearDepthStencilView(this->_deviceResources->_depthStencilDSV, D3D11_CLEAR_DEPTH, this->_deviceResources->clearDepth, 0);
+		this->_deviceResources->clearDepthSet = false;
     }
 
 	if (FAILED(this->_deviceResources->RenderMain(this->_deviceResources->_backbufferSurface->_buffer, this->_deviceResources->_displayWidth, this->_deviceResources->_displayHeight, this->_deviceResources->_displayBpp)))
@@ -1325,6 +1287,8 @@ HRESULT Direct3DDevice::EndScene()
 	this->_deviceResources->sceneRendered = true;
 
 	this->_deviceResources->inScene = false;
+
+	this->_deviceResources->_stereoContext.OnEndScene();
 
 	return D3D_OK;
 }
